@@ -1,124 +1,84 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+// world.js — Palmera Bay city generation and collision. Pure logic, no drawing, no DOM.
+// Grid city: roads every 260px, blocks hold buildings / parks / plaza; beach + water on the west edge.
+import { WORLD, BUILDING_COLORS, mulberry32, clamp } from './config.js';
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+export const ROAD_NAMES = ['Ocean Drive', 'Palm Row', 'Coral Ave', 'Sunset Blvd', 'Marina Way', 'Flamingo St', 'Bayside Rd', 'Neon Lane'];
+export const DISTRICTS = ['Oceanfront', 'Downtown', 'Marina District', 'Old Town', 'Palm Heights', 'The Docks'];
 
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
-
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+export function isRoad(x, y) {
+  if (x < 0 || y < 0 || x >= WORLD.size || y >= WORLD.size) return false;
+  const pitch = WORLD.block + WORLD.road;
+  const mx = x % pitch, my = y % pitch;
+  return mx < WORLD.road || my < WORLD.road;
+}
+export function isWater(x, y) { return x < WORLD.beach - 60; }
+export function isBeach(x, y) { return x >= WORLD.beach - 60 && x < WORLD.beach; }
+export function districtAt(x, y) {
+  const gx = Math.floor(x / 900), gy = Math.floor(y / 900);
+  return DISTRICTS[(gx + gy * 2) % DISTRICTS.length];
+}
+export function roadNameAt(x, y) {
+  const pitch = WORLD.block + WORLD.road;
+  const ix = Math.floor(x / pitch), iy = Math.floor(y / pitch);
+  return ROAD_NAMES[(ix + iy) % ROAD_NAMES.length];
 }
 
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
-  }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
-
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
-  }
-
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
-  }
-
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
-  }
-
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
-  }
-
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
-
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
+export function createCity(seed = 7) {
+  const rand = mulberry32(seed);
+  const buildings = [], trees = [], lamps = [], pickups = [];
+  const pitch = WORLD.block + WORLD.road;
+  const blocks = Math.floor(WORLD.size / pitch);
+  for (let bx = 0; bx < blocks; bx++) {
+    for (let by = 0; by < blocks; by++) {
+      const x0 = bx * pitch + WORLD.road, y0 = by * pitch + WORLD.road;
+      const kind = rand();
+      if (kind < 0.14) { // park
+        for (let i = 0; i < 6; i++) trees.push({ x: x0 + 30 + rand() * 200, y: y0 + 30 + rand() * 200, r: 12 + rand() * 10 });
         continue;
       }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
-        }
-      }
+      if (kind < 0.2) continue; // empty plaza / parking lot
+      const w = 90 + rand() * 90, h = 90 + rand() * 90;
+      const bx2 = x0 + (WORLD.block - w) / 2, by2 = y0 + (WORLD.block - h) / 2;
+      buildings.push({
+        x: bx2, y: by2, w, h, color: BUILDING_COLORS[Math.floor(rand() * BUILDING_COLORS.length)],
+        height: 1 + Math.floor(rand() * 3),
+        name: (by === 0 ? 'Hotel ' : by % 3 === 0 ? 'Apts ' : 'Offices ') + String.fromCharCode(65 + bx) + (by + 1),
+      });
+      if (rand() < 0.5) trees.push({ x: x0 + 20 + rand() * 200, y: y0 + 20 + rand() * 200, r: 10 + rand() * 8 });
     }
-    return events;
   }
-
-  reset();
-  return { state, reset, step };
+  // Street lamps along roads
+  for (let i = 0; i < WORLD.size; i += 350) {
+    lamps.push({ x: WORLD.road / 2, y: i }); lamps.push({ x: i, y: WORLD.road / 2 });
+  }
+  // Cash / health / ammo pickups scattered on sidewalks
+  const pickupKinds = ['cash', 'health', 'ammo', 'cash', 'health'];
+  for (let i = 0; i < 70; i++) {
+    const x = 120 + rand() * (WORLD.size - 240), y = 120 + rand() * (WORLD.size - 240);
+    if (isRoad(x, y) || collidesBuilding(x, y, 10)) continue;
+    pickups.push({ x, y, kind: pickupKinds[i % pickupKinds.length], taken: false, bob: rand() * 6 });
+  }
+  function collidesBuilding(x, y, r) {
+    for (const b of buildings) if (x + r > b.x && x - r < b.x + b.w && y + r > b.y && y - r < b.y + b.h) return b;
+    return null;
+  }
+  function collideCircle(x, y, r) {
+    const b = collidesBuilding(x, y, r);
+    if (b) return b;
+    if (x < WORLD.beach - 50 || x > WORLD.size - 20 || y < 20 || y > WORLD.size - 20) return { wall: true };
+    return null;
+  }
+  // Snap a point to the nearest road centre (for spawning cars / mission markers).
+  function nearestRoadPoint(x, y) {
+    const pitch2 = WORLD.block + WORLD.road;
+    const cx = Math.round((x - WORLD.road / 2) / pitch2) * pitch2 + WORLD.road / 2;
+    const cy = Math.round((y - WORLD.road / 2) / pitch2) * pitch2 + WORLD.road / 2;
+    return { x: clamp(cx, 100, WORLD.size - 100), y: clamp(cy, 100, WORLD.size - 100) };
+  }
+  function randomRoadPoint() {
+    const rx = WORLD.road / 2 + Math.floor(rand() * blocks) * pitch;
+    const ry = WORLD.road / 2 + Math.floor(rand() * blocks) * pitch;
+    return Math.random() < 0.5 ? { x: rx, y: 200 + rand() * 2200 } : { x: 200 + rand() * 2200, y: ry };
+  }
+  return { buildings, trees, lamps, pickups, collidesBuilding, collideCircle, nearestRoadPoint, randomRoadPoint, blocks };
 }
